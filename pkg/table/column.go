@@ -765,6 +765,89 @@ func OptionalFsp(fieldType *types.FieldType) string {
 	return "(" + strconv.Itoa(fsp) + ")"
 }
 
+// GeneratedColumnDependsOnTimestamp checks if a generated column depends on any TIMESTAMP column.
+// When a generated column references a TIMESTAMP column, its expression must be evaluated in UTC
+// to produce consistent results regardless of session timezone.
+func GeneratedColumnDependsOnTimestamp(genCol *model.ColumnInfo, allCols []*model.ColumnInfo) bool {
+	if !genCol.IsGenerated() || len(genCol.Dependences) == 0 {
+		return false
+	}
+	for _, col := range allCols {
+		if _, ok := genCol.Dependences[col.Name.L]; ok {
+			if col.FieldType.GetType() == mysql.TypeTimestamp {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// ConvertTimestampDatumsToUTC converts all TIMESTAMP column values in the row from
+// session timezone to UTC. It returns a restore function that converts them back.
+// This is used to ensure generated column expressions are evaluated in UTC context.
+func ConvertTimestampDatumsToUTC(row []types.Datum, cols []*model.ColumnInfo, from *time.Location) func() {
+	if from == time.UTC {
+		return func() {}
+	}
+	var converted []int
+	for _, col := range cols {
+		if col.FieldType.GetType() == mysql.TypeTimestamp && col.Offset < len(row) && !row[col.Offset].IsNull() &&
+			row[col.Offset].Kind() == types.KindMysqlTime {
+			t := row[col.Offset].GetMysqlTime()
+			if err := t.ConvertTimeZone(from, time.UTC); err == nil {
+				row[col.Offset].SetMysqlTime(t)
+				converted = append(converted, col.Offset)
+			}
+		}
+	}
+	return func() {
+		for _, offset := range converted {
+			t := row[offset].GetMysqlTime()
+			if err := t.ConvertTimeZone(time.UTC, from); err == nil {
+				row[offset].SetMysqlTime(t)
+			}
+		}
+	}
+}
+
+// ConvertTimestampMutRowToUTC converts TIMESTAMP column values in a chunk.MutRow from
+// session timezone to UTC. It returns a restore function that converts them back.
+// The colOffset is added to each column's Offset to get the position in the MutRow.
+func ConvertTimestampMutRowToUTC(evalBuffer chunk.MutRow, cols []*model.ColumnInfo, colOffset int, from *time.Location) func() {
+	if from == time.UTC {
+		return func() {}
+	}
+	type converted struct {
+		pos     int
+		origVal types.Time
+	}
+	var convertedCols []converted
+	row := evalBuffer.ToRow()
+	for _, col := range cols {
+		if col.FieldType.GetType() == mysql.TypeTimestamp {
+			bufIdx := col.Offset + colOffset
+			if row.IsNull(bufIdx) {
+				continue
+			}
+			origTime := row.GetTime(bufIdx)
+			newTime := origTime
+			if err := newTime.ConvertTimeZone(from, time.UTC); err == nil {
+				convertedCols = append(convertedCols, converted{pos: bufIdx, origVal: origTime})
+				d := types.NewDatum(nil)
+				d.SetMysqlTime(newTime)
+				evalBuffer.SetDatum(bufIdx, d)
+			}
+		}
+	}
+	return func() {
+		for _, c := range convertedCols {
+			d := types.NewDatum(nil)
+			d.SetMysqlTime(c.origVal)
+			evalBuffer.SetDatum(c.pos, d)
+		}
+	}
+}
+
 // FillVirtualColumnValue will calculate the virtual column value by evaluating generated
 // expression using rows from a chunk, and then fill this value into the chunk.
 func FillVirtualColumnValue(virtualRetTypes []*types.FieldType, virtualColumnIndex []int,

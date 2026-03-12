@@ -17,11 +17,13 @@ package executor
 import (
 	"context"
 	"strings"
+	"time"
 
 	"github.com/pingcap/errors"
 	"github.com/pingcap/tidb/pkg/errno"
 	"github.com/pingcap/tidb/pkg/executor/internal/exec"
 	"github.com/pingcap/tidb/pkg/expression"
+	"github.com/pingcap/tidb/pkg/expression/exprctx"
 	"github.com/pingcap/tidb/pkg/infoschema"
 	"github.com/pingcap/tidb/pkg/kv"
 	"github.com/pingcap/tidb/pkg/meta/autoid"
@@ -211,6 +213,29 @@ func updateRecord(
 
 	// Step 4: fill auto generated columns
 	evalCtx := sctx.GetExprCtx().GetEvalCtx()
+	tblMeta := t.Meta()
+
+	// Pre-compute UTC eval context if any stored generated column depends on TIMESTAMP.
+	// Only stored (non-virtual) generated columns need UTC evaluation.
+	// Skip UTC on partitioned tables: partition boundaries use session-TZ values.
+	// See https://github.com/pingcap/tidb/issues/66753
+	var utcEvalCtx exprctx.EvalContext
+	var sessionLoc *time.Location
+	if tblMeta.GetPartitionInfo() == nil {
+		for _, assign := range assignments {
+			idx := assign.Col.Index - offset
+			if idx < 0 || idx >= len(tblMeta.Columns) {
+				continue
+			}
+			colInfo := tblMeta.Columns[idx]
+			if !colInfo.IsVirtualGenerated() && table.GeneratedColumnDependsOnTimestamp(colInfo, tblMeta.Columns) {
+				sessionLoc = evalCtx.Location()
+				utcEvalCtx = exprctx.CtxWithUTCLocation(sctx.GetExprCtx()).GetEvalCtx()
+				break
+			}
+		}
+	}
+
 	for _, assign := range assignments {
 		// Insert statements may have LazyErr, handle it first.
 		if assign.LazyErr != nil {
@@ -220,9 +245,34 @@ func updateRecord(
 		// For Update statements, Index may be larger than len(newData)
 		// e.g. update t a, t b set a.c1 = 1, b.c2 = 2;
 		idxInCols := assign.Col.Index - offset
-		rawVal, err := assign.Expr.Eval(evalCtx, evalBuffer.ToRow())
+		// For stored generated columns depending on TIMESTAMP, temporarily convert
+		// TIMESTAMP inputs to UTC, evaluate in UTC context, then restore.
+		useUTC := false
+		if utcEvalCtx != nil && idxInCols >= 0 && idxInCols < len(tblMeta.Columns) {
+			colInfo := tblMeta.Columns[idxInCols]
+			useUTC = !colInfo.IsVirtualGenerated() &&
+				table.GeneratedColumnDependsOnTimestamp(colInfo, tblMeta.Columns)
+		}
+		curEvalCtx := evalCtx
+		var restoreFn func()
+		if useUTC {
+			restoreFn = table.ConvertTimestampMutRowToUTC(evalBuffer, tblMeta.Columns, offset, sessionLoc)
+			curEvalCtx = utcEvalCtx
+		}
+		rawVal, err := assign.Expr.Eval(curEvalCtx, evalBuffer.ToRow())
+		if restoreFn != nil {
+			restoreFn()
+		}
 		if err == nil {
 			newData[idxInCols], err = table.CastValue(sctx, rawVal, assign.Col.ToInfo(), false, false)
+		}
+		// If the generated column result type is TIMESTAMP and we evaluated in UTC,
+		// convert back from UTC to session TZ to avoid double-conversion by the storage layer.
+		if useUTC && assign.Col.GetStaticType().GetType() == mysql.TypeTimestamp && !newData[idxInCols].IsNull() && newData[idxInCols].Kind() == types.KindMysqlTime {
+			mt := newData[idxInCols].GetMysqlTime()
+			if convErr := mt.ConvertTimeZone(time.UTC, sessionLoc); convErr == nil {
+				newData[idxInCols].SetMysqlTime(mt)
+			}
 		}
 		evalBuffer.SetDatum(assign.Col.Index, newData[idxInCols])
 
